@@ -32,8 +32,8 @@ gl = "0.14"
 #surfman = { git = "https://github.com/servo/surfman" }
 surfman = "0.9.3"
 
-glutin = { path = "../glutin/glutin", default-features = false }
-glutin-winit = { path = "../glutin/glutin-winit", default-features = false }
+glutin = { git = "https://github.com/rust-windowing/glutin", default-features = false }
+glutin-winit = { git = "https://github.com/rust-windowing/glutin", default-features = false }
 png = { version = "0.17.6" }
 raw-window-handle = "0.5"
 winit = { version = "0.29.2", default-features = false, features = ["rwh_05"] }
