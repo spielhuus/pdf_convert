@@ -1,176 +1,54 @@
-use std::sync::Arc;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::{self, Path};
+use std::{fs::File, io::BufWriter, path::PathBuf};
 
-use crate::{graphics_state::Fill, plotter::{Backend, DrawMode}, scene::Scene};
+use gl::types::GLvoid;
+use glutin::api::egl::device::Device;
+use glutin::api::egl::display::Display;
+use glutin::config::{ConfigSurfaceTypes, ConfigTemplate, ConfigTemplateBuilder};
+use glutin::context::{ContextApi, ContextAttributesBuilder};
+use glutin::prelude::*;
 
 use pathfinder_color::{ColorF, ColorU};
-use pathfinder_content::{dash::OutlineDash, effects::BlendMode, fill::FillRule, gradient::Gradient, outline::Outline, pattern::Pattern, stroke::OutlineStrokeToFill};
-use pathfinder_geometry::{
-    vector::Vector2F,
-    rect::RectF, transform2d::Transform2F,
-};
-use pdf::object::{ImageXObject, Ref, Resolve, Resources};
+use pathfinder_content::{dash::OutlineDash, fill::FillRule, outline::Outline, stroke::OutlineStrokeToFill};
+use pathfinder_export::{Export, FileFormat};
+use pathfinder_geometry::{rect::RectF, transform2d::Transform2F};
+use pathfinder_renderer::{paint::{Paint, PaintId}, scene::{ClipPathId, DrawPath, Scene}};
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct PaintId(pub u16);
+use euclid::default::Size2D;
+use pathfinder_canvas::{Canvas, CanvasFontContext, Path2D};
+use pathfinder_geometry::vector::{vec2f, vec2i};
+use pathfinder_gl::{GLDevice, GLVersion};
+use pathfinder_renderer::concurrent::rayon::RayonExecutor;
+use pathfinder_renderer::concurrent::scene_proxy::SceneProxy;
+use pathfinder_renderer::gpu::options::{DestFramebuffer, RendererMode, RendererOptions};
+use pathfinder_renderer::gpu::renderer::Renderer;
+use pathfinder_renderer::options::BuildOptions;
+use pathfinder_resources::embedded::EmbeddedResourceLoader;
 
-#[derive(Clone, Debug)]
-pub struct DrawPath {
-    /// The actual vector path outline.
-    pub outline: Outline,
-    /// The ID of the paint that specifies how to fill the interior of this outline.
-    pub paint: PaintId,
-    /// The ID of an optional clip path that will be used to clip this path.
-    pub clip_path: Option<ClipPathId>,
-    /// How to fill this path (winding or even-odd).
-    pub fill_rule: FillRule,
-    /// How to blend this path with everything below it.
-    pub blend_mode: BlendMode,
-    /// The name of this path, for debugging.
-    ///
-    /// Pass the empty string (which does not allocate) if debugging is not needed.
-    pub name: String,
-}
+use crate::plotter::{BlendMode, DrawMode, Fill, Plotter};
 
-impl DrawPath {
-    /// Creates a new draw path with the given outline and paint.
-    ///
-    /// Initially, there is no clip path, the fill rule is set to winding, the blend mode is set to
-    /// source-over, and the path has no name.
-    #[inline]
-    pub fn new(outline: Outline, paint: PaintId) -> DrawPath {
-        DrawPath {
-            outline,
-            paint,
-            clip_path: None,
-            fill_rule: FillRule::Winding,
-            blend_mode: BlendMode::SrcOver,
-            name: String::new(),
-        }
-    }
-
-    /// Returns the outline of this path, which defines its vector commands.
-    #[inline]
-    pub fn outline(&self) -> &Outline {
-        &self.outline
-    }
-
-    #[inline]
-    pub(crate) fn clip_path(&self) -> Option<ClipPathId> {
-        self.clip_path
-    }
-
-    /// Sets a previously-defined clip path that will be used to limit the filled region of this
-    /// path.
-    ///
-    /// Clip paths are defined in world space, not relative to the bounds of this path.
-    #[inline]
-    pub fn set_clip_path(&mut self, new_clip_path: Option<ClipPathId>) {
-        self.clip_path = new_clip_path
-    }
-
-    #[inline]
-    pub(crate) fn paint(&self) -> PaintId {
-        self.paint
-    }
-
-    #[inline]
-    pub(crate) fn fill_rule(&self) -> FillRule {
-        self.fill_rule
-    }
-
-    /// Sets the fill rule: even-odd or winding.
-    #[inline]
-    pub fn set_fill_rule(&mut self, new_fill_rule: FillRule) {
-        self.fill_rule = new_fill_rule
-    }
-
-    #[inline]
-    pub(crate) fn blend_mode(&self) -> BlendMode {
-        self.blend_mode
-    }
-
-    /// Sets the blend mode, which specifies how this path will be composited with content
-    /// underneath it.
-    #[inline]
-    pub fn set_blend_mode(&mut self, new_blend_mode: BlendMode) {
-        self.blend_mode = new_blend_mode
-    }
-
-    /// Assigns a name to this path, for debugging.
-    #[inline]
-    pub fn set_name(&mut self, new_name: String) {
-        self.name = new_name
+fn blend_mode(mode: BlendMode) -> pathfinder_content::effects::BlendMode {
+    match mode {
+        BlendMode::Darken => pathfinder_content::effects::BlendMode::Multiply,
+        BlendMode::Overlay => pathfinder_content::effects::BlendMode::Overlay,
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub struct Paint {
-    base_color: ColorU,
-    overlay: Option<PaintOverlay>,
-}
-
-impl Paint {
-    #[inline]
-    pub fn black() -> Paint {
-        Paint::from_color(ColorU::black())
-    }
-    #[inline]
-    pub fn from_color(color: ColorU) -> Paint {
-        Paint { base_color: color, overlay: None }
-    }
-}
-
-
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub struct PaintOverlay {
-    composite_op: PaintCompositeOp,
-    contents: PaintContents,
-}
-
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub(crate) enum PaintContents {
-    /// A gradient, either linear or radial.
-    Gradient(Gradient),
-    /// A raster image pattern.
-    Pattern(Pattern),
-}
-
-//impl Debug for PaintContents {
-//    fn fmt(&self, formatter: &mut Fomatter) -> fmt::Result {
-//        match *self {
-//            PaintContents::Gradient(ref gradient) => gradient.fmt(formatter),
-//            PaintContents::Pattern(ref pattern) => pattern.fmt(formatter),
-//        }
-//    }
-//}
-
-/// The ID of a gradient, unique to a scene.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct GradientId(pub u32);
-
-/// How an overlay is to be composited over a base color.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum PaintCompositeOp {
-    /// The source that overlaps the destination, replaces the destination.
-    SrcIn,
-    /// Destination which overlaps the source, replaces the source.
-    DestIn,
-}
-#[derive(Copy, Clone, Debug)]
-pub struct ClipPathId(pub usize);
-
-pub struct Png {
+pub struct PngPlotter {
     scene: Scene,
 }
 
-impl Png {
-    pub fn new() -> Self {
-        Self{
-            scene: Scene::new(),
+impl PngPlotter {
+    pub fn new(view_box: RectF) -> Self {
+        let mut scene = Scene::new();
+        scene.set_view_box(view_box);
+        let white = scene.push_paint(&Paint::from_color(ColorU::white()));
+        scene.push_draw_path(DrawPath::new(Outline::from_rect(view_box), white));
+        Self {
+            scene,
         }
-    }
-    pub fn finish(self) -> Scene  {
-        self.scene
     }
     fn paint(&mut self, fill: Fill, alpha: f32) -> PaintId {
         let paint = match fill {
@@ -181,22 +59,19 @@ impl Png {
         };
         self.scene.push_paint(&paint)
     }
+
+    pub fn write(&mut self, file: PathBuf) {
+        render(&mut self.scene, file);
+    }
 }
 
-impl Backend for Png {
+impl Plotter for PngPlotter {
     type ClipPathId = ClipPathId;
-
-    fn create_clip_path(&mut self, path: Outline, fill_rule: FillRule, parent: Option<Self::ClipPathId>) -> Self::ClipPathId {
-        todo!()
-    }
-
     fn draw(&mut self, outline: &Outline, mode: &DrawMode, fill_rule: FillRule, transform: Transform2F, clip: Option<Self::ClipPathId>) {
         match mode {
             DrawMode::Fill { fill } | DrawMode::FillStroke {fill, .. } => {
                 let paint = self.paint(fill.color, fill.alpha);
-                let mut outline = outline.clone();
-                outline.transform(&transform);
-                let mut draw_path = DrawPath::new(outline, paint);
+                let mut draw_path = DrawPath::new(outline.clone().transformed(&transform), paint);
                 draw_path.set_clip_path(clip);
                 draw_path.set_fill_rule(fill_rule);
                 draw_path.set_blend_mode(blend_mode(fill.mode));
@@ -209,7 +84,7 @@ impl Backend for Png {
                 let paint = self.paint(stroke.color, stroke.alpha);
                 let contour = match stroke_mode.dash_pattern {
                     Some((ref pat, phase)) => {
-                        let dashed = OutlineDash::new(outline, &*pat, phase).into_outline();
+                        let dashed = OutlineDash::new(outline, pat, phase).into_outline();
                         let mut stroke = OutlineStrokeToFill::new(&dashed, stroke_mode.style);
                         stroke.offset();
                         stroke.into_outline()
@@ -220,9 +95,7 @@ impl Backend for Png {
                         stroke.into_outline()
                     }
                 };
-                let mut contour = outline.clone();
-                contour.transform(&transform);
-                let mut draw_path = DrawPath::new(contour, paint);
+                let mut draw_path = DrawPath::new(contour.transformed(&transform), paint);
                 draw_path.set_clip_path(clip);
                 draw_path.set_fill_rule(fill_rule);
 
@@ -232,27 +105,87 @@ impl Backend for Png {
             _ => {}
         }
     }
-
-    fn set_view_box(&mut self, r: pathfinder_geometry::rect::RectF) {
-        println!("view box");
-    }
-
-    fn draw_image(&mut self, xref: Ref<pdf::object::XObject>, im: &ImageXObject, resources: &Resources, transform: Transform2F, mode: crate::plotter::BlendMode, clip: Option<Self::ClipPathId>, resolve: &impl pdf::object::Resolve) {
-        println!("draw image");
-    }
-
-    fn draw_inline_image(&mut self, im: &Arc<ImageXObject>, resources: &Resources, transform: Transform2F, mode: crate::plotter::BlendMode, clip: Option<Self::ClipPathId>, resolve: &impl Resolve) {
-        println!("draw inline");
-    }
-
-    fn add_text(&mut self, span: crate::plotter::TextSpan, clip: Option<Self::ClipPathId>) {
-        println!("add text");
-    }
 }
 
-fn blend_mode(mode: crate::plotter::BlendMode) -> pathfinder_content::effects::BlendMode {
-    match mode {
-        crate::plotter::BlendMode::Darken => pathfinder_content::effects::BlendMode::Multiply,
-        crate::plotter::BlendMode::Overlay => pathfinder_content::effects::BlendMode::Overlay,
+use png::{BitDepth, ColorType, Encoder};
+use std::mem;
+use std::slice;
+use surfman::{Connection, ContextAttributeFlags, ContextAttributes, GLApi, GLVersion as SurfmanGLVersion};
+use surfman::{SurfaceAccess, SurfaceType};
+
+fn render(scene: &mut Scene, output: PathBuf) {
+
+    let view_box = dbg!(scene.view_box());
+    let size = view_box.size().ceil().to_i32();
+    let transform = Transform2F::from_translation(-view_box.origin());
+
+    let connection = Connection::new().unwrap();
+    //let native_widget = connection.create_native_widget_from_winit_window(&window).unwrap();
+    let adapter = connection.create_adapter().unwrap();
+    let mut device = connection.create_device(&adapter).unwrap();
+
+    // Request an OpenGL 3.x context. Pathfinder requires this.
+    let context_attributes = ContextAttributes {
+        version: SurfmanGLVersion::new(3, 0),
+        flags: ContextAttributeFlags::ALPHA,
+    };
+    let context_descriptor = device.create_context_descriptor(&context_attributes).unwrap();
+
+    // Make the OpenGL context via `surfman`, and load OpenGL functions.
+    let surface_type = SurfaceType::Generic { size: Size2D::new(size.x(), size.y()) };
+    let mut context = device.create_context(&context_descriptor, None).unwrap();
+    let surface = device.create_surface(&context, SurfaceAccess::GPUOnly, surface_type)
+                        .unwrap();
+    device.bind_surface_to_context(&mut context, surface).unwrap();
+    device.make_context_current(&context).unwrap();
+    gl::load_with(|symbol_name| device.get_proc_address(&context, symbol_name));
+
+    let framebuffer_size = vec2i(size.x() as i32, size.y() as i32);
+
+    // Create a Pathfinder GL device.
+    let default_framebuffer = device.context_surface_info(&context)
+                                    .unwrap()
+                                    .unwrap()
+                                    .framebuffer_object;
+    let pathfinder_device = GLDevice::new(GLVersion::GL3, default_framebuffer);
+
+    // Create a Pathfinder renderer.
+    let mode = RendererMode::default_for_device(&pathfinder_device);
+    let options = RendererOptions {
+        dest: DestFramebuffer::full_window(framebuffer_size),
+        background_color: Some(ColorF::white()),
+        ..RendererOptions::default()
+    };
+    let resource_loader = EmbeddedResourceLoader::new();
+    let mut renderer = Renderer::new(pathfinder_device, &resource_loader, mode, options);
+
+    scene.build_and_render(&mut renderer, BuildOptions::default(), RayonExecutor);
+    let mut pixels: Vec<u8> = vec![0; size.x() as usize * size.y() as usize * 4];
+
+    unsafe {
+        gl::ReadPixels(
+            0,
+            0,
+            size.x(),
+            size.y(),
+            gl::RGBA,
+            gl::UNSIGNED_BYTE,
+            pixels.as_mut_ptr() as *mut GLvoid,
+        );
     }
+
+    let file = File::create(output).unwrap();
+    let mut encoder = Encoder::new(
+        file,
+        size.x() as u32,
+        size.y() as u32,
+    );
+    encoder.set_color(ColorType::Rgba);
+    encoder.set_depth(BitDepth::Eight);
+    let mut image_writer = encoder.write_header().unwrap();
+    image_writer.write_image_data(&pixels).unwrap();
+
+    // Clean up.
+    drop(device.destroy_context(&mut context));
 }
+

@@ -2,12 +2,14 @@ use std::path::PathBuf;
 
 extern crate pathfinder_geometry as g;
 
+//mod common;
 mod plotter;
 mod graphics_state;
 mod text_state;
 mod render;
+//mod screen_plotter;
 mod vector_plotter;
-//mod png;
+mod png;
 
 use clap::Parser;
 use g::rect::RectF;
@@ -35,7 +37,8 @@ struct Args {
     output: PathBuf,
 }
 
-const SCALE: f32 = 25.4 / 72.;
+//const SCALE: f32 = 25.4 / 72.;
+const SCALE: f32 = 1.0;
 
 pub fn page_bounds(page: &Page) -> g::rect::RectF {
     let Rect { left, right, top, bottom } = page.media_box().expect("no media box");
@@ -72,6 +75,8 @@ pub fn convert(input: PathBuf, output: PathBuf, page_nr: u32) -> Result<(), PdfE
         let resources = pdf::t!(page.resources());
 
     let mut plotter = vector_plotter::VectorPlotter::new(view_box);
+    let mut plotter = png::PngPlotter::new(view_box);
+    //let mut plotter = screen_plotter::ScreenPlotter::new(view_box);
     let mut render = RenderState::new(&mut plotter, &mut resolve, resources, root_transformation);
     render.render(&page)?;
     plotter.write(output);
@@ -86,6 +91,6 @@ mod test {
     //test convert sample pdf file to svg
     #[test]
     fn test_pdf_to_svg() {
-        super::convert(Path::new("rack.pdf").to_path_buf(), Path::new("rack.svg").to_path_buf(), 0).unwrap();
+        super::convert(Path::new("rack.pdf").to_path_buf(), Path::new("rack.png").to_path_buf(), 0).unwrap();
     }
 }
