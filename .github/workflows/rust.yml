@@ -19,7 +19,7 @@ jobs:
     - name: glxinfo
       run: |
         sudo apt-get update
-        sudo apt-get install -y mesa-utils xvfb
+        sudo apt-get install -y mesa-utils xvfb wayland
         xvfb-run glxinfo
     - name: Build
       run: cargo build --verbose
