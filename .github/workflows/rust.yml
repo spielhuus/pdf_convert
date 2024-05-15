@@ -17,6 +17,11 @@ jobs:
     steps:
     - uses: openrndr/setup-opengl@v1.1
     - uses: actions/checkout@v4
+    - name: glxinfo
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y mesa-utils xvfb
+        xvfb-run glxinfo
     - name: Build
       run: cargo build --verbose
     - name: Run tests
