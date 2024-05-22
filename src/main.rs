@@ -4,6 +4,7 @@ extern crate pathfinder_geometry as g;
 
 //mod common;
 mod plotter;
+//mod fontentry;
 mod graphics_state;
 mod text_state;
 mod render;
